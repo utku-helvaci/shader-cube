@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+[Desktop Entry]
+Type=Application
+Name=shader-cube
+GenericName=Shader Demo
+Comment=Shadertoy shaders on a bouncing, glowing cube with PhysX debris
+Exec=shader-cube
+Icon=shader-cube
+Terminal=false
+Categories=Graphics;3DGraphics;
+Keywords=shadertoy;opengl;vulkan;physx;demo;
+Actions=Vulkan;OpenGL;
+
+[Desktop Action Vulkan]
+Name=Run with Vulkan
+Exec=shader-cube --api vulkan
+
+[Desktop Action OpenGL]
+Name=Run with OpenGL
+Exec=shader-cube --api gl

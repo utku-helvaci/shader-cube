@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: MIT
+# Builds the portable AppImage with tools/appimage/build.sh, starts it on a
+# clean Ubuntu 22.04 (smoke test), and publishes it: as a workflow artifact on
+# every run, and as a GitHub release for v* tags.
+name: AppImage
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_TAR: build/ci/image.tar.zst
+  PHYSX_DIR: build/appimage/PhysX
+  PHYSX_GPU_LIB: build/appimage/PhysX/physx/lib/bin/linux.x86_64/release/libPhysXGpu_64.so
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, for the version in the file name
+
+      # From scratch, the build image (toolchain, CUDA, static GLFW and
+      # shaderc) and PhysX (CUDA kernels for four GPU generations) take most
+      # of an hour.  Both are cached, keyed on the files that define them.
+      - name: Restore the build image
+        id: image
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.IMAGE_TAR }}
+          key: appimage-image-${{ hashFiles('tools/appimage/Dockerfile', 'tools/appimage/versions.sh') }}
+
+      - name: Load the build image
+        if: steps.image.outputs.cache-hit == 'true'
+        run: zstd -dc "$IMAGE_TAR" | docker load
+
+      - name: Restore the PhysX build
+        id: physx
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PHYSX_DIR }}
+          key: appimage-physx-${{ hashFiles('tools/build_physx.sh', 'tools/appimage/Dockerfile', 'tools/appimage/versions.sh') }}
+
+      - name: Build and smoke-test the AppImage
+        run: tools/appimage/build.sh --test
+
+      # Saved even if a later step failed, so a retry starts from them.
+      - name: Export the build image
+        id: export
+        if: always() && steps.image.outputs.cache-hit != 'true'
+        run: |
+          if docker images -q shader-cube-appimage | grep -q .; then
+            mkdir -p "$(dirname "$IMAGE_TAR")"
+            docker images --format '{{.Repository}}:{{.Tag}}' shader-cube-appimage |
+              xargs docker save | zstd -T0 -3 -q -o "$IMAGE_TAR"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the build image
+        if: always() && steps.export.outputs.ready == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.IMAGE_TAR }}
+          key: ${{ steps.image.outputs.cache-primary-key }}
+
+      - name: Check the PhysX build
+        id: physx-built
+        if: always() && steps.physx.outputs.cache-hit != 'true'
+        run: |
+          if [ -f "$PHYSX_GPU_LIB" ]; then echo "ready=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save the PhysX build
+        if: always() && steps.physx-built.outputs.ready == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PHYSX_DIR }}
+          key: ${{ steps.physx.outputs.cache-primary-key }}
+
+      - name: Upload the AppImage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shader-cube-AppImage
+          path: dist/*.AppImage
+          if-no-files-found: error
+          compression-level: 0 # already compressed
+
+      - name: Upload the smoke test renders
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-test
+          path: dist/smoke-test/
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shader-cube-AppImage
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum -- *.AppImage > SHA256SUMS
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber -- *.AppImage SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "shader-cube $GITHUB_REF_NAME" --generate-notes -- *.AppImage SHA256SUMS
+          fi
