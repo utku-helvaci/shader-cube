@@ -8,7 +8,9 @@
 #     WORK  scratch space and caches (the PhysX build is kept here)
 #     DIST  where the .AppImage is written
 #
-# Environment: VERSION, JOBS, PHYSX_DIR (default WORK/PhysX), PHYSX_CUDA_ARCH,
+# Environment: VERSION, JOBS, PHYSX_SRC (PhysX sources, default the
+# SRC/third_party/PhysX submodule), PHYSX_DIR (its build, default WORK/PhysX),
+# PHYSX_CUDA_ARCH,
 # PHYSX_GPU, SHADER_CUBE_PKGS (pkg-config packages to link), APPIMAGETOOL,
 # APPIMAGE_RUNTIME, RUNTIME_URL (for its notice), STATIC_LICENSES (license
 # texts of statically linked libraries, default /opt/deps/share/licenses).
@@ -20,8 +22,9 @@ DIST=$(cd "$3" && pwd)
 VERSION=${VERSION:-dev}
 JOBS=${JOBS:-$(nproc)}
 ARCH=$(uname -m)
+PHYSX_SRC="${PHYSX_SRC:-$SRC/third_party/PhysX}"
 PHYSX_DIR="${PHYSX_DIR:-$WORK/PhysX}"
-export PHYSX_DIR
+export PHYSX_SRC PHYSX_DIR
 
 step() { printf '\n==> %s\n' "$*"; }
 

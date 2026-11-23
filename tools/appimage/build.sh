@@ -35,6 +35,12 @@ VERSION=${VERSION:-$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null
 export VERSION
 mkdir -p "$ROOT/dist"
 
+# The PhysX sources: the third_party/PhysX submodule (only its commit, and
+# without the Git LFS files of omni/, which isn't used).
+if [ ! -f "$ROOT/third_party/PhysX/physx/version.txt" ]; then
+    GIT_LFS_SKIP_SMUDGE=1 git -C "$ROOT" submodule update --init --depth 1 -- third_party/PhysX
+fi
+
 if [ "$MODE" = container ]; then
     # Tagged with a hash of everything the image is built from, so an
     # existing image (an earlier build, or one restored by CI) is reused as is.
@@ -70,8 +76,8 @@ else
     fetch "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256" "$TOOLS/appimagetool"
     fetch "$RUNTIME_URL" "$RUNTIME_SHA256" "$TOOLS/runtime"
     chmod +x "$TOOLS/appimagetool"
-    # Reuses the regular third_party/PhysX build (this machine's GPU only).
-    PHYSX_DIR=${PHYSX_DIR:-$ROOT/third_party/PhysX} RUNTIME_URL="$RUNTIME_URL" \
+    # Reuses the regular `make physx` build (this machine's GPU only).
+    PHYSX_DIR=${PHYSX_DIR:-$ROOT/build/PhysX} RUNTIME_URL="$RUNTIME_URL" \
     APPIMAGETOOL="$TOOLS/appimagetool" APPIMAGE_RUNTIME="$TOOLS/runtime" APPIMAGE_EXTRACT_AND_RUN=1 \
         "$HERE/bundle.sh" "$ROOT" "$ROOT/build/appimage-host" "$ROOT/dist"
 fi

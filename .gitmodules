@@ -1,0 +1,4 @@
+[submodule "third_party/PhysX"]
+	path = third_party/PhysX
+	url = https://github.com/NVIDIA-Omniverse/PhysX.git
+	shallow = true

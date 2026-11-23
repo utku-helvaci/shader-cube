@@ -32,6 +32,14 @@ jobs:
         with:
           fetch-depth: 0 # tags, for the version in the file name
 
+      # Only the pinned commit (not PhysX's history), and without the Git LFS
+      # files of omni/, which isn't used.
+      - name: Fetch the PhysX submodule
+        id: physx-src
+        run: |
+          GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 -- third_party/PhysX
+          echo "commit=$(git -C third_party/PhysX rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       # From scratch, the build image (toolchain, CUDA, static GLFW and
       # shaderc) and PhysX (CUDA kernels for four GPU generations) take most
       # of an hour.  Both are cached, keyed on the files that define them.
@@ -51,7 +59,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.PHYSX_DIR }}
-          key: appimage-physx-${{ hashFiles('tools/build_physx.sh', 'tools/appimage/Dockerfile', 'tools/appimage/versions.sh') }}
+          key: appimage-physx-${{ steps.physx-src.outputs.commit }}-${{ hashFiles('tools/build_physx.sh', 'tools/appimage/Dockerfile', 'tools/appimage/versions.sh') }}
 
       - name: Build and smoke-test the AppImage
         run: tools/appimage/build.sh --test

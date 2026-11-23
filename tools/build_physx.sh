@@ -1,8 +1,13 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# Fetch and build the NVIDIA PhysX SDK (static CPU libraries + the CUDA GPU
-# module libPhysXGpu_64.so) into third_party/PhysX.  `make` picks it up
-# automatically once third_party/PhysX/physx/lib/bin exists.
+# Build the NVIDIA PhysX SDK (static CPU libraries + the CUDA GPU module
+# libPhysXGpu_64.so) from the third_party/PhysX git submodule into
+# build/PhysX.  `make` picks it up automatically once
+# build/PhysX/physx/lib/bin exists.
+#
+# The submodule is never modified: its physx/ directory is copied into the
+# build directory, patched and built there.  The copy is replaced when the
+# submodule is moved to another commit or its files are edited.
 #
 #   tools/build_physx.sh                   # GPU arch from nvidia-smi, else 86
 #   PHYSX_CUDA_ARCH=89 tools/build_physx.sh
@@ -11,24 +16,47 @@
 #                                          # first (its PTX covers the rest)
 #   PHYSX_GPU=0 tools/build_physx.sh       # CPU-only build (no CUDA needed)
 #   PHYSX_DIR=/elsewhere tools/build_physx.sh   # build somewhere else
+#   PHYSX_SRC=/a/PhysX/clone tools/build_physx.sh   # other PhysX sources
 set -eu
 cd "$(dirname "$0")/.."
 
-TAG=110.3-omni-and-physx-5.9.1          # PhysX SDK 5.9.1
-SRC=${PHYSX_DIR:-third_party/PhysX}
+SUBMODULE=third_party/PhysX             # NVIDIA-Omniverse/PhysX, PhysX SDK 5.9.1
+SRC=${PHYSX_SRC:-$SUBMODULE}
+OUT=${PHYSX_DIR:-build/PhysX}
 GPU=${PHYSX_GPU:-1}
 JOBS=${JOBS:-$(nproc)}
 
-if [ ! -d "$SRC/physx" ]; then
-    mkdir -p "$(dirname "$SRC")"
-    git clone --depth 1 --filter=blob:none --sparse --branch "$TAG" \
-        https://github.com/NVIDIA-Omniverse/PhysX.git "$SRC"
-    git -C "$SRC" sparse-checkout set physx
-    # A plain source tree, not a nested repository: editors would otherwise
-    # offer it for commits (and it holds the build output).
-    rm -rf "$SRC/.git"
+if [ ! -f "$SRC/physx/version.txt" ]; then
+    if [ "$SRC" = "$SUBMODULE" ]; then
+        # Only the commit itself (.gitmodules: shallow), and without the Git
+        # LFS files of omni/, which isn't used.
+        GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 -- "$SUBMODULE"
+    else
+        echo "error: no PhysX sources in $SRC" >&2
+        echo "(in a shader-cube clone: git submodule update --init --depth 1 $SUBMODULE)" >&2
+        exit 1
+    fi
 fi
-P="$SRC/physx"
+
+# Which sources the build directory holds: the commit plus any local edits,
+# or for a plain source tree, its version.
+source_id() {
+    if [ "$(git -C "$SRC" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$SRC" && pwd -P)" ]; then
+        echo "commit $(git -C "$SRC" rev-parse HEAD)"
+        git -C "$SRC" diff HEAD -- physx
+    else
+        echo "version $(cat "$SRC/physx/version.txt")"
+    fi
+}
+ID=$(source_id | sha256sum | cut -d' ' -f1)
+P="$OUT/physx"
+if [ "$(cat "$OUT/source-id" 2>/dev/null)" != "$ID" ]; then
+    echo "copying the PhysX sources from $SRC to $OUT"
+    rm -rf "$P" "$OUT/build" "$OUT/source-id"
+    mkdir -p "$OUT"
+    cp -a "$SRC/physx" "$OUT/"
+    echo "$ID" > "$OUT/source-id"
+fi
 
 # Source patches.  Each is applied only while its target is still unpatched:
 # rewriting a file would bump its mtime and recompile every CUDA kernel.
@@ -70,13 +98,13 @@ GEN=""
 command -v ninja >/dev/null 2>&1 && GEN="-G Ninja"
 
 # shellcheck disable=SC2086
-cmake -S "$P" -B "$SRC/build" $GEN \
+cmake -S "$P" -B "$OUT/build" $GEN \
     -DCMAKE_BUILD_TYPE=release \
     -DPX_GENERATE_STATIC_LIBRARIES=ON \
     -DPX_GENERATE_GPU_STATIC_LIBRARIES=OFF \
     -DPX_BUILDSNIPPETS=OFF -DPX_BUILDPVDRUNTIME=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     $GPU_FLAGS
-cmake --build "$SRC/build" -j "$JOBS"
+cmake --build "$OUT/build" -j "$JOBS"
 echo "PhysX libraries:"
 find "$P/lib/bin" -name "*.a" -o -name "*.so" | sort
