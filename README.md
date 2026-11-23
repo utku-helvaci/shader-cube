@@ -2,9 +2,10 @@
 
 A cube with a Shadertoy shader on each face, bouncing around a room with a moving light. The faces emit light: each one acts as an area light on the room, and the floor reflects the cube. Hundreds of PhysX rigid bodies litter the floor and get knocked around by the cube and the light. Renders with OpenGL ES 3.0, OpenGL 4.3 or Vulkan 1.3, in real time or offline to image files.
 
+    make physx    # once: NVIDIA PhysX, from the third_party/PhysX submodule (optional)
     make && ./shader-cube
 
-Needs GLFW, libepoxy, Vulkan headers + loader, shaderc and libpng (Arch: `glfw libepoxy vulkan-headers vulkan-icd-loader shaderc libpng`).
+Needs GLFW, libepoxy, Vulkan headers + loader, shaderc and libpng (Arch: `glfw libepoxy vulkan-headers vulkan-icd-loader shaderc libpng`), and for PhysX, CMake and the CUDA toolkit (see [PhysX](#physx)).
 
 ## GPU selection
 
@@ -52,12 +53,25 @@ Images are encoded on background threads. Ctrl+C stops early and still writes ev
 
 The debris is simulated by NVIDIA PhysX 5. On an NVIDIA GPU it runs PhysX's CUDA pipeline (GPU broad phase, contact generation and solver in `libPhysXGpu_64.so`); elsewhere it uses the CPU solver. The cube and the light are kinematic bodies that plough through the debris. `F8` blasts it into the air.
 
-PhysX is fetched and built once (CUDA toolkit needed for the GPU part):
+The SDK is the `third_party/PhysX` git submodule ([NVIDIA-Omniverse/PhysX](https://github.com/NVIDIA-Omniverse/PhysX), pinned to tag `110.3-omni-and-physx-5.9.1`, i.e. PhysX 5.9.1, Apache-2.0). It is built once (CUDA toolkit needed for the GPU part):
 
-    tools/build_physx.sh      # into third_party/PhysX; PHYSX_GPU=0 for a CPU-only build
+    make physx    # = tools/build_physx.sh, into build/PhysX; PHYSX_GPU=0 for a CPU-only build
     make
 
-The script builds the CUDA kernels only for the local GPU's architecture, and patches two incompatibilities with CUDA 13 and GCC 15+. Without PhysX, `make` still builds; the debris is just left out. `PHYSX_GPU_DEVICE` selects the CUDA device (default 0).
+`make physx` fetches the submodule itself if it isn't checked out: only the pinned commit, and without the Git LFS files of the repository's `omni/` directory, which shader-cube doesn't use. By hand, that is
+
+    GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 third_party/PhysX
+
+(`git clone --recurse-submodules` works too, but with git-lfs installed it also downloads those LFS files, about 120 MB.)
+
+The submodule is never modified. The script copies its `physx/` directory to `build/PhysX`, patches two incompatibilities with CUDA 13 and GCC 15+ there, and builds the CUDA kernels only for the local GPU's architecture. To move to another PhysX release, check out its tag in the submodule and commit that:
+
+    git -C third_party/PhysX fetch --depth 1 origin tag TAG && git -C third_party/PhysX checkout TAG
+    git add third_party/PhysX
+
+The next `make physx` then starts over from the new sources. `make clean` keeps the PhysX build, `make distclean` removes it.
+
+Without PhysX, `make` still builds; the debris is just left out. `PHYSX_GPU_DEVICE` selects the CUDA device (default 0).
 
 ## AppImage
 
@@ -76,7 +90,7 @@ The AppImage bundles everything except glibc, libstdc++ and the GPU drivers, whi
 
 `.github/workflows/appimage.yml` runs the same pipeline, smoke test included, on every push to `main`/`master`, on pull requests and on demand. The AppImage is attached to each run as the `shader-cube-AppImage` artifact; the smoke-test renders are uploaded too. Pushing a `v*` tag (e.g. `git tag v1.0.0 && git push origin v1.0.0`) also publishes a GitHub release with the AppImage and its `SHA256SUMS`.
 
-The first run takes about an hour: it builds the toolchain image and compiles PhysX's CUDA kernels on a 4-core runner. The image and the PhysX build are then cached, keyed on `Dockerfile`, `versions.sh` and `build_physx.sh`, and later runs take a few minutes. Changing one of those files rebuilds only what depends on it.
+The first run takes about an hour: it builds the toolchain image and compiles PhysX's CUDA kernels on a 4-core runner. The image and the PhysX build are then cached, keyed on `Dockerfile`, `versions.sh`, `build_physx.sh` and (for PhysX) the submodule's commit, and later runs take a few minutes. Changing one of those files rebuilds only what depends on it.
 
 ### Licenses in the AppImage
 
@@ -128,7 +142,8 @@ Not supported: Shadertoy image and cubemap textures, video, sound (the importer 
 | `src/gfx_vk.c` | Vulkan 1.3 backend (dynamic rendering, push descriptors, shaderc) |
 | `src/physics_physx.cpp` | PhysX scene (`physics_none.c` when built without PhysX) |
 | `src/imgout.c` | threaded PNG / PPM writer |
-| `tools/build_physx.sh` | fetches, patches and builds the PhysX SDK |
+| `third_party/PhysX` | git submodule: the NVIDIA PhysX SDK sources |
+| `tools/build_physx.sh` | patches and builds PhysX from the submodule, into `build/PhysX` |
 | `tools/appimage/` | AppImage pipeline: `build.sh` (entry), `Dockerfile`, `bundle.sh`, `smoke_test.sh`, pinned `versions.sh`, desktop entry and icon |
 | `.github/workflows/appimage.yml` | CI: builds and smoke-tests the AppImage, publishes releases for `v*` tags |
 

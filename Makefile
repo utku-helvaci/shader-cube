@@ -11,8 +11,9 @@ LDLIBS    = $(shell $(PKG_CONFIG) --libs $(PKGS)) -lpthread -lm
 OBJ = build/main.o build/gfx_gl.o build/gfx_vk.o build/imgout.o
 HDR = src/gfx.h src/mathx.h src/physics.h src/imgout.h
 
-# NVIDIA PhysX (tools/build_physx.sh).  Without it the debris is disabled.
-PHYSX_ROOT   ?= third_party/PhysX/physx
+# NVIDIA PhysX, built from the third_party/PhysX submodule by `make physx`
+# (tools/build_physx.sh).  Without it the debris is disabled.
+PHYSX_ROOT   ?= build/PhysX/physx
 PHYSX_LIBDIR ?= $(firstword $(wildcard $(PHYSX_ROOT)/lib/bin/linux.x86_64/release))
 ifneq ($(PHYSX_LIBDIR),)
 OBJ        += build/physics_physx.o
@@ -54,7 +55,12 @@ appimage-test:
 run: shader-cube
 	./shader-cube
 
+# The program only; the PhysX build and the AppImage caches stay.
 clean:
-	rm -rf build shader-cube
+	rm -f build/*.o shader-cube
 
-.PHONY: run clean physx appimage appimage-test
+# Everything that was built, PhysX included.
+distclean:
+	rm -rf build dist shader-cube
+
+.PHONY: run clean distclean physx appimage appimage-test
