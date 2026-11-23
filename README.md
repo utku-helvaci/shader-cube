@@ -88,7 +88,7 @@ The AppImage bundles everything except glibc, libstdc++ and the GPU drivers, whi
 
 ### GitHub Actions
 
-`.github/workflows/appimage.yml` runs the same pipeline, smoke test included, on every push to `main`/`master`, on pull requests and on demand. The AppImage is attached to each run as the `shader-cube-AppImage` artifact; the smoke-test renders are uploaded too. Pushing a `v*` tag (e.g. `git tag v1.0.0 && git push origin v1.0.0`) also publishes a GitHub release with the AppImage and its `SHA256SUMS`.
+`.github/workflows/appimage.yml` runs the same pipeline, smoke test included, on every push to `main`/`master`, on pull requests and on demand. The AppImage is attached to each run as the `shader-cube-AppImage` artifact; the smoke-test renders are uploaded too. Every push to `main`/`master` is also published on the repository's Releases page, as a release titled with the commit's first line (tag `build-<short commit hash>`) holding the AppImage and its `SHA256SUMS`; the newest is marked *Latest*. Pushing a `v*` tag (e.g. `git tag v1.0.0 && git push origin v1.0.0`) publishes a release of that version.
 
 The first run takes about an hour: it builds the toolchain image and compiles PhysX's CUDA kernels on a 4-core runner. The image and the PhysX build are then cached, keyed on `Dockerfile`, `versions.sh`, `build_physx.sh` and (for PhysX) the submodule's commit, and later runs take a few minutes. Changing one of those files rebuilds only what depends on it.
 
@@ -145,7 +145,7 @@ Not supported: Shadertoy image and cubemap textures, video, sound (the importer 
 | `third_party/PhysX` | git submodule: the NVIDIA PhysX SDK sources |
 | `tools/build_physx.sh` | patches and builds PhysX from the submodule, into `build/PhysX` |
 | `tools/appimage/` | AppImage pipeline: `build.sh` (entry), `Dockerfile`, `bundle.sh`, `smoke_test.sh`, pinned `versions.sh`, desktop entry and icon |
-| `.github/workflows/appimage.yml` | CI: builds and smoke-tests the AppImage, publishes releases for `v*` tags |
+| `.github/workflows/appimage.yml` | CI: builds and smoke-tests the AppImage, publishes it as a release for each push and `v*` tag |
 
 ## License
 

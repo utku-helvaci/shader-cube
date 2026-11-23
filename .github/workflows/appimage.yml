@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Builds the portable AppImage with tools/appimage/build.sh, starts it on a
 # clean Ubuntu 22.04 (smoke test), and publishes it: as a workflow artifact on
-# every run, and as a GitHub release for v* tags.
+# every run, and as a GitHub release for every push to main/master (named
+# after the commit) and every v* tag.
 name: AppImage
 
 on:
@@ -112,8 +113,11 @@ jobs:
           path: dist/smoke-test/
           if-no-files-found: ignore
 
+  # A push to main/master becomes a release titled with the commit's first
+  # line, under the tag build-<short SHA>; a v* tag becomes a release of that
+  # version.  A re-run replaces the files of its release.
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -127,12 +131,27 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           cd dist
           sha256sum -- *.AppImage > SHA256SUMS
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber -- *.AppImage SHA256SUMS
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG=$GITHUB_REF_NAME
+            set -- --title "shader-cube $TAG" --generate-notes
           else
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "shader-cube $GITHUB_REF_NAME" --generate-notes -- *.AppImage SHA256SUMS
+            TAG=build-${GITHUB_SHA::7}
+            TITLE=$(printf '%s\n' "$COMMIT_MESSAGE" | head -n 1)
+            NOTES=$RUNNER_TEMP/notes.md
+            { # the rest of the commit message, then where it came from
+              printf '%s\n' "$COMMIT_MESSAGE" | sed -e 1d -e '/./,$!d'
+              echo
+              echo "Built from $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA" \
+                "by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            } > "$NOTES"
+            set -- --title "${TITLE:-$TAG}" --notes-file "$NOTES" --target "$GITHUB_SHA"
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -- *.AppImage SHA256SUMS
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --latest "$@" -- *.AppImage SHA256SUMS
           fi

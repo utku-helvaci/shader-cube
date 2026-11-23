@@ -9,7 +9,7 @@
 #   ... --test                        then run smoke_test.sh on the result (a
 #                                     clean Ubuntu 22.04, software rendering)
 #
-# Environment: VERSION (default: git describe, else the date), JOBS,
+# Environment: VERSION (default: git describe, by v* tags only), JOBS,
 # PHYSX_CUDA_ARCH (default for the container build: see versions.sh),
 # PHYSX_GPU=0 for CPU-only PhysX.
 #
@@ -31,7 +31,7 @@ for arg in "$@"; do
     esac
 done
 
-VERSION=${VERSION:-$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || date +%Y.%m.%d)}
+VERSION=${VERSION:-$(git -C "$ROOT" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || date +%Y.%m.%d)}
 export VERSION
 mkdir -p "$ROOT/dist"
 
