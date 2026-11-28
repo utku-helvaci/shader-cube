@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# shellcheck shell=sh disable=SC2034
 # Pinned inputs of the AppImage pipeline, sourced by build.sh (which passes
 # them to the Dockerfile as build arguments).  Downloads are checked against
 # these SHA-256 sums.

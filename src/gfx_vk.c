@@ -2,6 +2,8 @@
 /*
  * Vulkan 1.3 backend: dynamic rendering, push descriptors, GLSL compiled to
  * SPIR-V at runtime with shaderc (so Shadertoy sources work unchanged).
+ * The Vulkan loader is opened at runtime (volk): without one, the program
+ * still runs with OpenGL.
  *
  * Every resource tracks its current image layout and the backend inserts
  * (conservative) barriers when a texture changes role.  Textures sampled by
@@ -12,7 +14,7 @@
  * The physical device is the first one the loader reports that can do the
  * job, so prime-run / MESA_VK_DEVICE_SELECT / DRI_PRIME decide, not us.
  */
-#include <vulkan/vulkan.h>
+#include "volk.h"
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <shaderc/shaderc.h>
@@ -56,6 +58,7 @@ struct GfxTex {
 struct GfxBuf {
     VkBuffer buf;
     VkDeviceMemory mem;
+    VkDeviceSize size;
 };
 
 typedef struct {
@@ -70,6 +73,7 @@ struct GfxProg {
     int vtx;
     PipeEntry pipes[MAX_PIPES];
     int npipes;
+    VkPipeline compute; /* compute programs: the one pipeline */
 };
 
 typedef struct {
@@ -100,8 +104,8 @@ static struct {
     uint32_t qfam;
     VkQueue queue;
     PFN_vkCmdPushDescriptorSetKHR push_desc;
-    VkDescriptorSetLayout dsl;
-    VkPipelineLayout layout;
+    VkDescriptorSetLayout dsl, cdsl; /* graphics, compute */
+    VkPipelineLayout layout, clayout;
     VkSampler samplers[3][2];
     shaderc_compiler_t sc;
     int float_linear, max_samples;
@@ -119,7 +123,7 @@ static struct {
 
     /* frames */
     Frame fr[FRAMES];
-    int cur, recording, acquired;
+    int cur, recording, acquired, window_passes;
     uint32_t sc_index;
 
     /* work outside a frame (texture init, uploads at load time) */
@@ -150,6 +154,7 @@ static const char *PRELUDE =
     "#define GFX_VULKAN 1\n"
     "#define GFX_UBO(n) layout(std140, set=0, binding=n) uniform\n"
     "#define GFX_TEX(n) layout(set=0, binding=n) uniform\n"
+    "#define GFX_SSBO(n) layout(std430, set=0, binding=n) buffer\n"
     "#define GFX_VERTEX_ID gl_VertexIndex\n"
     "#define GFX_CLIP(p) vec4((p).xy, ((p).z + (p).w) * 0.5, (p).w)\n";
 
@@ -366,7 +371,7 @@ static int pick_device(void) {
         VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f13};
         if (p.apiVersion >= VK_API_VERSION_1_3) vkGetPhysicalDeviceFeatures2(devs[i], &f2);
         if (p.apiVersion < VK_API_VERSION_1_3) why = "Vulkan 1.3 required";
-        else if (!f13.dynamicRendering) why = "no dynamic rendering";
+        else if (!f13.dynamicRendering || !f13.shaderDemoteToHelperInvocation) why = "Vulkan 1.3 features missing";
         else if (!dev_has_ext(devs[i], VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) why = "no VK_KHR_push_descriptor";
         else if (V.surface && !dev_has_ext(devs[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME)) why = "no swapchain";
         int qf = -1;
@@ -410,12 +415,14 @@ static void create_device(void) {
     uint32_t next = 0;
     exts[next++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
     if (V.surface) exts[next++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    /* discard compiles to OpDemoteToHelperInvocation for Vulkan 1.3 (Shadertoy shaders use it) */
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                            .dynamicRendering = VK_TRUE};
+                                            .dynamicRendering = VK_TRUE, .shaderDemoteToHelperInvocation = VK_TRUE};
     VkDeviceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f13,
                              .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
                              .enabledExtensionCount = next, .ppEnabledExtensionNames = exts};
     VKCHECK(vkCreateDevice(V.phys, &ci, NULL, &V.dev));
+    volkLoadDevice(V.dev);
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
     V.push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(V.dev, "vkCmdPushDescriptorSetKHR");
     vkGetPhysicalDeviceMemoryProperties(V.phys, &V.memprops);
@@ -544,7 +551,12 @@ static int vk_init(const GfxConfig *cfg, GLFWwindow *win) {
     memset(&V, 0, sizeof V);
     V.cfg = *cfg;
     V.win = win;
+    if (volkInitialize() != VK_SUCCESS) {
+        fprintf(stderr, "Vulkan: no Vulkan loader found (libvulkan.so.1 / vulkan-1.dll)\n");
+        return 0;
+    }
     create_instance();
+    volkLoadInstance(V.inst);
     if (win) VKCHECK(glfwCreateWindowSurface(V.inst, win, NULL, &V.surface));
     if (!pick_device()) return 0;
     create_device();
@@ -579,6 +591,20 @@ static int vk_init(const GfxConfig *cfg, GLFWwindow *win) {
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                       .setLayoutCount = 1, .pSetLayouts = &V.dsl};
     VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout));
+
+    /* Compute: binding 0 = uniform block, 1.. = storage buffers. */
+    VkDescriptorSetLayoutBinding cb[1 + GFX_MAX_SSBO];
+    for (int i = 0; i <= GFX_MAX_SSBO; i++)
+        cb[i] = (VkDescriptorSetLayoutBinding){
+            .binding = (uint32_t)i,
+            .descriptorType = i ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    dli.bindingCount = 1 + GFX_MAX_SSBO;
+    dli.pBindings = cb;
+    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.cdsl));
+    pli.pSetLayouts = &V.cdsl;
+    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.clayout));
 
     static const VkFilter filt[3] = {VK_FILTER_NEAREST, VK_FILTER_LINEAR, VK_FILTER_LINEAR};
     static const VkSamplerAddressMode wraps[2] = {VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
@@ -645,6 +671,8 @@ static void vk_shutdown(void) {
         for (int w = 0; w < 2; w++) vkDestroySampler(V.dev, V.samplers[f][w], NULL);
     vkDestroyPipelineLayout(V.dev, V.layout, NULL);
     vkDestroyDescriptorSetLayout(V.dev, V.dsl, NULL);
+    vkDestroyPipelineLayout(V.dev, V.clayout, NULL);
+    vkDestroyDescriptorSetLayout(V.dev, V.cdsl, NULL);
     shaderc_compiler_release(V.sc);
     vkDestroyDevice(V.dev, NULL);
     if (V.surface) vkDestroySurfaceKHR(V.inst, V.surface, NULL);
@@ -662,6 +690,15 @@ static int vk_is_nvidia(void) { return V.props.vendorID == 0x10DE; }
 static int vk_float32_filterable(void) { return V.float_linear; }
 static int vk_max_samples(void) { return V.max_samples; }
 static int vk_flip_y(void) { return 1; }
+static int vk_has_compute(void) { return 1; } /* every Vulkan 1.3 graphics queue can compute */
+
+static void vk_set_vsync(int on) {
+    if (V.cfg.vsync == !!on) return;
+    V.cfg.vsync = !!on;
+    V.sc_dirty = 1; /* new present mode with the next swapchain */
+}
+
+static void end_rendering_cmd(void);
 
 /* ---------------------------------------------------------------- textures */
 
@@ -847,7 +884,75 @@ static GfxBuf *vk_buffer(const void *data, size_t size) {
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &b->buf, &b->mem, &map);
     memcpy(map, data, size);
     vkUnmapMemory(V.dev, b->mem);
+    b->size = size;
     return b;
+}
+
+/* Everything before it (transfers, compute, draws, also earlier frames on
+ * the queue) completes and is visible to everything after it. */
+static void full_barrier(VkCommandBuffer c) {
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                          .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                          .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+                         NULL, 0, NULL);
+}
+
+static void vk_buf_write(GfxBuf *b, size_t off, const void *data, size_t size) {
+    if (!size) return;
+    if (V.rendering) end_rendering_cmd();
+    VkCommandBuffer c = work_cmd();
+    VkBuffer src;
+    VkDeviceSize soff;
+    stage(data, size, &src, &soff);
+    full_barrier(c);
+    VkBufferCopy r = {soff, off, size};
+    vkCmdCopyBuffer(c, src, b->buf, 1, &r);
+    full_barrier(c);
+}
+
+static GfxBuf *vk_storage(const void *data, size_t size) {
+    GfxBuf *b = calloc(1, sizeof *b);
+    b->size = size;
+    make_buffer(size,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &b->buf, &b->mem, NULL);
+    if (data) {
+        vk_buf_write(b, 0, data, size);
+    } else {
+        VkCommandBuffer c = work_cmd();
+        full_barrier(c);
+        vkCmdFillBuffer(c, b->buf, 0, VK_WHOLE_SIZE, 0);
+        full_barrier(c);
+    }
+    return b;
+}
+
+static void vk_buf_read(GfxBuf *b, size_t off, void *dst, size_t size) {
+    if (V.recording) { /* only between frames */
+        fprintf(stderr, "Vulkan: buf_read inside a frame\n");
+        memset(dst, 0, size);
+        return;
+    }
+    VkBuffer rb;
+    VkDeviceMemory rm;
+    void *map;
+    make_buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                &rb, &rm, &map);
+    VkCommandBuffer c = work_cmd();
+    full_barrier(c);
+    VkBufferCopy r = {off, 0, size};
+    vkCmdCopyBuffer(c, b->buf, rb, 1, &r);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                          .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    flush_setup();
+    memcpy(dst, map, size);
+    vkDestroyBuffer(V.dev, rb, NULL);
+    vkFreeMemory(V.dev, rm, NULL);
 }
 
 static void vk_buf_free(GfxBuf *b) {
@@ -858,8 +963,10 @@ static void vk_buf_free(GfxBuf *b) {
     free(b);
 }
 
-static VkShaderModule compile(const char *const *chunks, int n, int is_vs, const char *label) {
-    const char *stage = is_vs ? "#define GFX_VS 1\n" : "#define GFX_FS 1\n";
+enum { ST_VS, ST_FS, ST_CS };
+
+static VkShaderModule compile(const char *const *chunks, int n, int st, const char *label) {
+    const char *stage = st == ST_VS ? "#define GFX_VS 1\n" : st == ST_FS ? "#define GFX_FS 1\n" : "#define GFX_CS 1\n";
     size_t len = strlen(PRELUDE) + strlen(stage);
     for (int i = 0; i < n; i++) len += strlen(chunks[i]);
     char *src = malloc(len + 1), *p = src;
@@ -874,7 +981,9 @@ static VkShaderModule compile(const char *const *chunks, int n, int is_vs, const
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
     shaderc_compile_options_set_auto_map_locations(o, true);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(
-        V.sc, src, len, is_vs ? shaderc_vertex_shader : shaderc_fragment_shader, label, "main", o);
+        V.sc, src, len,
+        st == ST_VS ? shaderc_vertex_shader : st == ST_FS ? shaderc_fragment_shader : shaderc_compute_shader, label,
+        "main", o);
     shaderc_compile_options_release(o);
     free(src);
     VkShaderModule m = VK_NULL_HANDLE;
@@ -891,8 +1000,8 @@ static VkShaderModule compile(const char *const *chunks, int n, int is_vs, const
 }
 
 static GfxProg *vk_program(const GfxProgDesc *d) {
-    VkShaderModule vs = compile(d->vs, d->nvs, 1, d->label);
-    VkShaderModule fs = vs ? compile(d->fs, d->nfs, 0, d->label) : VK_NULL_HANDLE;
+    VkShaderModule vs = compile(d->vs, d->nvs, ST_VS, d->label);
+    VkShaderModule fs = vs ? compile(d->fs, d->nfs, ST_FS, d->label) : VK_NULL_HANDLE;
     if (!vs || !fs) {
         if (vs) vkDestroyShaderModule(V.dev, vs, NULL);
         return NULL;
@@ -905,12 +1014,29 @@ static GfxProg *vk_program(const GfxProgDesc *d) {
     return p;
 }
 
+static GfxProg *vk_compute(const char *label, const char *const *src, int n) {
+    VkShaderModule cs = compile(src, n, ST_CS, label);
+    if (!cs) return NULL;
+    VkComputePipelineCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = cs, .pName = "main"},
+        .layout = V.clayout,
+    };
+    GfxProg *p = calloc(1, sizeof *p);
+    snprintf(p->label, sizeof p->label, "%s", label);
+    VKCHECK(vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p->compute));
+    vkDestroyShaderModule(V.dev, cs, NULL);
+    return p;
+}
+
 static void vk_prog_free(GfxProg *p) {
     if (!p) return;
     vk_wait_idle();
     destroy_pipelines(p);
-    vkDestroyShaderModule(V.dev, p->vs, NULL);
-    vkDestroyShaderModule(V.dev, p->fs, NULL);
+    if (p->vs) vkDestroyShaderModule(V.dev, p->vs, NULL);
+    if (p->fs) vkDestroyShaderModule(V.dev, p->fs, NULL);
+    if (p->compute) vkDestroyPipeline(V.dev, p->compute, NULL);
     V.bound = VK_NULL_HANDLE;
     free(p);
 }
@@ -918,7 +1044,7 @@ static void vk_prog_free(GfxProg *p) {
 static VkPipeline get_pipeline(GfxProg *p, const GfxDraw *d) {
     GfxTex *rt = V.pass.msaa ? V.pass.msaa : V.pass_color;
     PipeEntry key = {.color = rt->vkfmt, .has_depth = V.pass.depth != NULL, .samples = rt->samples,
-                     .depth = d->depth, .cull = d->cull, .blend = d->blend_add};
+                     .depth = d->depth, .cull = d->cull, .blend = d->blend};
     for (int i = 0; i < p->npipes; i++) {
         PipeEntry *e = &p->pipes[i];
         if (e->color == key.color && e->has_depth == key.has_depth && e->samples == key.samples &&
@@ -942,12 +1068,18 @@ static VkPipeline get_pipeline(GfxProg *p, const GfxDraw *d) {
         {2, 0, VK_FORMAT_R32G32_SFLOAT, 24},       {3, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
         {4, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 16}, {5, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 32},
     };
+    VkVertexInputBindingDescription ub = {0, GFX_UI_STRIDE, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription ua[4] = {
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 8},
+        {2, 0, VK_FORMAT_R8G8B8A8_UNORM, 16}, {3, 0, VK_FORMAT_R32G32B32_SFLOAT, 20},
+    };
+    int ui = p->vtx == GFX_VTX_UI;
     VkPipelineVertexInputStateCreateInfo vi = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount = p->vtx == GFX_VTX_NONE ? 0 : p->vtx == GFX_VTX_MESH ? 1 : 2,
-        .pVertexBindingDescriptions = vb,
-        .vertexAttributeDescriptionCount = p->vtx == GFX_VTX_NONE ? 0 : p->vtx == GFX_VTX_MESH ? 3 : 6,
-        .pVertexAttributeDescriptions = va,
+        .vertexBindingDescriptionCount = p->vtx == GFX_VTX_NONE ? 0 : p->vtx == GFX_VTX_MESH_INST ? 2 : 1,
+        .pVertexBindingDescriptions = ui ? &ub : vb,
+        .vertexAttributeDescriptionCount = p->vtx == GFX_VTX_NONE ? 0 : ui ? 4 : p->vtx == GFX_VTX_MESH ? 3 : 6,
+        .pVertexAttributeDescriptions = ui ? ua : va,
     };
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -965,14 +1097,15 @@ static VkPipeline get_pipeline(GfxProg *p, const GfxDraw *d) {
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = (VkSampleCountFlagBits)key.samples};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-                                                .depthTestEnable = (VkBool32)key.depth,
-                                                .depthWriteEnable = (VkBool32)key.depth,
+                                                .depthTestEnable = key.depth != GFX_DEPTH_OFF,
+                                                .depthWriteEnable = key.depth == GFX_DEPTH_RW,
                                                 .depthCompareOp = VK_COMPARE_OP_LESS};
+    VkBlendFactor dst = key.blend == GFX_BLEND_ALPHA ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : VK_BLEND_FACTOR_ONE;
     VkPipelineColorBlendAttachmentState ba = {
-        .blendEnable = (VkBool32)key.blend,
-        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .blendEnable = key.blend != GFX_BLEND_NONE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE, .dstColorBlendFactor = dst,
         .colorBlendOp = VK_BLEND_OP_ADD,
-        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = dst,
         .alphaBlendOp = VK_BLEND_OP_ADD,
         .colorWriteMask = 0xF,
     };
@@ -1009,6 +1142,7 @@ static void vk_begin_frame(void) {
     f->ring.off = 0;
     V.recording = 1;
     V.acquired = 0;
+    V.window_passes = 0;
     V.bound = VK_NULL_HANDLE;
     if (V.surface) { /* Wayland never reports a resize as out-of-date */
         int w, h;
@@ -1084,6 +1218,8 @@ static void end_rendering(void) {
     V.rendering = 0;
 }
 
+static void end_rendering_cmd(void) { end_rendering(); }
+
 static void vk_begin_pass(const GfxPass *p) {
     VkCommandBuffer c = V.fr[V.cur].cmd;
     V.pass = *p;
@@ -1097,7 +1233,9 @@ static void vk_begin_pass(const GfxPass *p) {
             return;
         }
         V.pass_color = &V.sc_tex[V.sc_index];
-        V.pass_color->layout = VK_IMAGE_LAYOUT_UNDEFINED; /* contents are always redrawn */
+        /* The frame's first pass redraws the whole window; later ones (the
+         * menu) draw over it. */
+        if (!V.window_passes++) V.pass_color->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         transition(c, V.pass_color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     } else {
         V.pass_color = p->color;
@@ -1118,6 +1256,7 @@ static void vk_pass_size(int *w, int *h) { *w = V.pass_w; *h = V.pass_h; }
 static void vk_draw(const GfxDraw *d) {
     if (V.pass_skip) return;
     if (d->prog->vtx == GFX_VTX_MESH_INST && d->ninst <= 0) return;
+    if (d->vdata && d->count <= 0) return;
     VkCommandBuffer c = V.fr[V.cur].cmd;
     Ring *ring = &V.fr[V.cur].ring;
     for (int i = 0; i < GFX_MAX_TEX; i++) {
@@ -1160,25 +1299,68 @@ static void vk_draw(const GfxDraw *d) {
     }
     if (n) V.push_desc(c, VK_PIPELINE_BIND_POINT_GRAPHICS, V.layout, 0, n, w);
 
-    uint32_t ninst = 1;
+    uint32_t ninst = 1, first = (uint32_t)d->first;
     if (d->vbuf) {
         VkDeviceSize zero = 0;
         vkCmdBindVertexBuffers(c, 0, 1, &d->vbuf->buf, &zero);
-        if (d->prog->vtx == GFX_VTX_MESH_INST) {
+    } else if (d->vdata) {
+        size_t bytes = (size_t)d->count * (d->prog->vtx == GFX_VTX_UI ? GFX_UI_STRIDE : GFX_VTX_STRIDE);
+        VkDeviceSize off = ring_alloc(ring, bytes, 16);
+        memcpy(ring->map + off, d->vdata, bytes);
+        vkCmdBindVertexBuffers(c, 0, 1, &ring->buf, &off);
+        first = 0;
+    }
+    if (d->prog->vtx == GFX_VTX_MESH_INST) {
+        if (d->inst_buf) {
+            VkDeviceSize zero = 0;
+            vkCmdBindVertexBuffers(c, 1, 1, &d->inst_buf->buf, &zero);
+        } else {
             size_t bytes = (size_t)d->ninst * GFX_INST_STRIDE;
             VkDeviceSize off = ring_alloc(ring, bytes, 16);
             memcpy(ring->map + off, d->inst, bytes);
             vkCmdBindVertexBuffers(c, 1, 1, &ring->buf, &off);
-            ninst = (uint32_t)d->ninst;
         }
+        ninst = (uint32_t)d->ninst;
     }
-    vkCmdDraw(c, (uint32_t)d->count, ninst, (uint32_t)d->first, 0);
+    vkCmdDraw(c, (uint32_t)d->count, ninst, first, 0);
 }
 
 static void vk_end_pass(void) {
     if (V.pass_skip) return;
     if (V.pending_clear && !V.rendering) begin_rendering();
     end_rendering();
+}
+
+static void vk_dispatch(const GfxDispatch *d) {
+    if (!d->prog || !d->prog->compute || !V.recording) return;
+    VkCommandBuffer c = V.fr[V.cur].cmd;
+    end_rendering();
+    Ring *ring = &V.fr[V.cur].ring;
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, d->prog->compute);
+    VkWriteDescriptorSet w[1 + GFX_MAX_SSBO];
+    VkDescriptorBufferInfo bi[1 + GFX_MAX_SSBO];
+    uint32_t n = 0;
+    if (d->ubo_size > 0) {
+        VkDeviceSize off = ring_alloc(ring, (VkDeviceSize)d->ubo_size, V.props.limits.minUniformBufferOffsetAlignment);
+        memcpy(ring->map + off, d->ubo, (size_t)d->ubo_size);
+        bi[n] = (VkDescriptorBufferInfo){ring->buf, off, (VkDeviceSize)d->ubo_size};
+        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                      .pBufferInfo = &bi[n]};
+        n++;
+    }
+    for (int i = 0; i < GFX_MAX_SSBO; i++) {
+        if (!d->buf[i]) continue;
+        bi[n] = (VkDescriptorBufferInfo){d->buf[i]->buf, 0, VK_WHOLE_SIZE};
+        w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)(1 + i),
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                      .pBufferInfo = &bi[n]};
+        n++;
+    }
+    if (n) V.push_desc(c, VK_PIPELINE_BIND_POINT_COMPUTE, V.clayout, 0, n, w);
+    vkCmdDispatch(c, (uint32_t)d->groups[0], (uint32_t)(d->groups[1] ? d->groups[1] : 1),
+                  (uint32_t)(d->groups[2] ? d->groups[2] : 1));
+    full_barrier(c);
 }
 
 static void vk_end_frame(void) {
@@ -1216,11 +1398,17 @@ static void vk_end_frame(void) {
 }
 
 const GfxBackend gfx_vk_backend = {
-    "Vulkan",
-    vk_window_hints, vk_init, vk_shutdown, vk_device_name, vk_is_nvidia,
-    vk_float32_filterable, vk_max_samples, vk_flip_y,
-    vk_texture, vk_upload, vk_gen_mips, vk_readback, vk_tex_free,
-    vk_buffer, vk_buf_free,
-    vk_program, vk_prog_free,
-    vk_begin_frame, vk_begin_pass, vk_pass_size, vk_draw, vk_end_pass, vk_end_frame, vk_wait_idle,
+    .name = "Vulkan",
+    .window_hints = vk_window_hints, .init = vk_init, .shutdown = vk_shutdown,
+    .device_name = vk_device_name, .is_nvidia = vk_is_nvidia, .float32_filterable = vk_float32_filterable,
+    .max_samples = vk_max_samples, .flip_y = vk_flip_y, .has_compute = vk_has_compute,
+    .set_vsync = vk_set_vsync,
+    .texture = vk_texture, .upload = vk_upload, .gen_mips = vk_gen_mips, .readback = vk_readback,
+    .tex_free = vk_tex_free,
+    .buffer = vk_buffer, .storage = vk_storage, .buf_write = vk_buf_write, .buf_read = vk_buf_read,
+    .buf_free = vk_buf_free,
+    .program = vk_program, .compute = vk_compute, .prog_free = vk_prog_free,
+    .begin_frame = vk_begin_frame, .dispatch = vk_dispatch, .begin_pass = vk_begin_pass,
+    .pass_size = vk_pass_size, .draw = vk_draw, .end_pass = vk_end_pass, .end_frame = vk_end_frame,
+    .wait_idle = vk_wait_idle,
 };

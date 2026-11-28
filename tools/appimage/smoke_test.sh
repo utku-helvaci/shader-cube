@@ -1,8 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 # Starts an AppImage on a clean Ubuntu 22.04 (the pipeline's baseline) with
-# no GPU: Mesa's software renderers draw one small frame through each API.
-# Proves the bundle is complete and runs on the oldest supported system.
+# no GPU: Mesa's software renderers draw one small frame of each scene
+# through each API.  Proves the bundle is complete and runs on the oldest
+# supported system.
 #
 #   tools/appimage/smoke_test.sh dist/shader-cube-VERSION-x86_64.AppImage [OUTDIR]
 set -eu
@@ -22,16 +23,21 @@ docker run --rm -v "$APPIMAGE:/app/shader-cube.AppImage:ro" -v "$OUT:/out" "$BAS
     cd /tmp
     export XDG_RUNTIME_DIR=/tmp/xdg
     mkdir -m 700 -p "$XDG_RUNTIME_DIR"
-    app="/app/shader-cube.AppImage --appimage-extract-and-run --res 64 --size 320x180 --at 0.25"
+    app="/app/shader-cube.AppImage --appimage-extract-and-run --res 64 --size 320x180 --at 0.5"
+    galton="--scene galton --balls 300"
     echo "--- Vulkan (lavapipe, no window system)"
     $app --api vulkan --screenshot /out/vulkan.png
+    $app --api vulkan $galton --physics compute --screenshot /out/vulkan-galton.png
+    $app --api vulkan $galton --physics compute --menu --screenshot /out/vulkan-menu.png
     echo "--- OpenGL ES (llvmpipe, Xvfb)"
     xvfb-run -a $app --api gles --screenshot /out/gles.png
+    xvfb-run -a $app --api gles $galton --physics cpu --screenshot /out/gles-galton.png
     echo "--- OpenGL 4.3 (llvmpipe, Xvfb)"
     xvfb-run -a $app --api gl --screenshot /out/gl.png
+    xvfb-run -a $app --api gl $galton --physics compute --screenshot /out/gl-galton.png
     chown -R "$(stat -c %u:%g /out)" /out
 '
-for f in vulkan gles gl; do
+for f in vulkan gles gl vulkan-galton gles-galton gl-galton vulkan-menu; do
     [ -s "$OUT/$f.png" ] || { echo "smoke test FAILED: no $f.png" >&2; exit 1; }
 done
-echo "smoke test passed: $OUT/{vulkan,gles,gl}.png"
+echo "smoke test passed: $OUT/{vulkan,gles,gl}{,-galton}.png, vulkan-menu.png"

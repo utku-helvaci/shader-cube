@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Builds the portable AppImage with tools/appimage/build.sh, starts it on a
-# clean Ubuntu 22.04 (smoke test), and publishes it: as a workflow artifact on
-# every run, and as a GitHub release for every push to main/master (named
-# after the commit) and every v* tag.
-name: AppImage
+# Builds shader-cube for Linux (a portable AppImage, tools/appimage/) and
+# Windows (a zip, tools/windows/), starts both with software rendering (smoke
+# tests), and publishes them: as workflow artifacts on every run, and as a
+# GitHub release for every push to main/master (named after the commit) and
+# every v* tag.
+name: Build
 
 on:
   push:
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: appimage-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -26,6 +27,7 @@ env:
 
 jobs:
   build:
+    name: Linux (AppImage)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -113,12 +115,110 @@ jobs:
           path: dist/smoke-test/
           if-no-files-found: ignore
 
+  # PhysX with MSVC (CUDA for its GPU part) into shader-cube-physx.dll, the
+  # program with MSYS2's MinGW-w64 (UCRT64), then the zip and a smoke test
+  # with Mesa's software renderers.
+  windows:
+    name: Windows (zip)
+    runs-on: windows-2025
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      CUDA_ROOT: build/windows/cuda
+      PHYSX_DIR: build/windows/PhysX
+      PHYSX_DLL_DIR: build/windows/physx-dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, for the version in the file name
+
+      - name: Fetch the PhysX submodule
+        id: physx-src
+        run: |
+          GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --depth 1 -- third_party/PhysX
+          echo "commit=$(git -C third_party/PhysX rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # CUDA (about 100 MB of NVIDIA's archives) and the PhysX build (most of
+      # an hour from scratch) are cached, keyed on what defines them.
+      - name: Restore CUDA
+        id: cuda
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CUDA_ROOT }}
+          key: windows-cuda-${{ hashFiles('tools/windows/versions.sh') }}
+
+      - name: Restore the PhysX build
+        id: physx
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PHYSX_DIR }}
+          key: windows-physx-${{ steps.physx-src.outputs.commit }}-${{ hashFiles('tools/build_physx.sh', 'tools/windows/physx.sh', 'tools/windows/versions.sh', 'tools/appimage/versions.sh') }}
+
+      - name: Set up MSVC (x64)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { "$($matches[1])=$($matches[2])" | Out-File $env:GITHUB_ENV -Append -Encoding utf8 }
+          }
+
+      - name: Build PhysX and shader-cube-physx.dll
+        run: tools/windows/physx.sh "$PHYSX_DLL_DIR"
+
+      - name: Save CUDA
+        if: always() && steps.cuda.outputs.cache-hit != 'true' && hashFiles('build/windows/cuda/bin/nvcc.exe') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CUDA_ROOT }}
+          key: ${{ steps.cuda.outputs.cache-primary-key }}
+
+      - name: Save the PhysX build
+        if: always() && steps.physx.outputs.cache-hit != 'true' && hashFiles('build/windows/PhysX/**/PhysXGpu_64.dll') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PHYSX_DIR }}
+          key: ${{ steps.physx.outputs.cache-primary-key }}
+
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
+        with:
+          msystem: UCRT64
+          update: true
+          install: make zip unzip git
+          pacboy: >-
+            gcc:p pkgconf:p binutils:p glfw:p libepoxy:p vulkan-headers:p shaderc:p libpng:p
+            mesa:p vulkan-loader:p
+
+      - name: Build and smoke-test the zip
+        shell: msys2 {0}
+        run: tools/windows/build.sh --test
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shader-cube-windows
+          path: dist/*-windows-x86_64.zip
+          if-no-files-found: error
+          compression-level: 0 # already compressed
+
+      - name: Upload the smoke test renders
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-test-windows
+          path: dist/smoke-test-windows/
+          if-no-files-found: ignore
+
   # A push to main/master becomes a release titled with the commit's first
   # line, under the tag build-<short SHA>; a v* tag becomes a release of that
-  # version.  A re-run replaces the files of its release.
+  # version.  A re-run replaces the files of its release.  The Windows zip is
+  # added when that job succeeded; a failed Windows build doesn't hold back
+  # the AppImage.
   release:
-    if: github.event_name == 'push'
-    needs: build
+    if: always() && github.event_name == 'push' && needs.build.result == 'success'
+    needs: [build, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -128,13 +228,22 @@ jobs:
           name: shader-cube-AppImage
           path: dist
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.windows.result == 'success'
+        with:
+          name: shader-cube-windows
+          path: dist
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           cd dist
-          sha256sum -- *.AppImage > SHA256SUMS
+          set -- *.AppImage
+          for f in *.zip; do if [ -f "$f" ]; then set -- "$@" "$f"; fi; done
+          FILES="$*"
+          sha256sum -- "$@" > SHA256SUMS
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             TAG=$GITHUB_REF_NAME
             set -- --title "shader-cube $TAG" --generate-notes
@@ -151,7 +260,9 @@ jobs:
             set -- --title "${TITLE:-$TAG}" --notes-file "$NOTES" --target "$GITHUB_SHA"
           fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -- *.AppImage SHA256SUMS
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -- $FILES SHA256SUMS
           else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --latest "$@" -- *.AppImage SHA256SUMS
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --latest "$@" -- $FILES SHA256SUMS
           fi

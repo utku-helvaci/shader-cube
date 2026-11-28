@@ -17,6 +17,8 @@
 #   PHYSX_GPU=0 tools/build_physx.sh       # CPU-only build (no CUDA needed)
 #   PHYSX_DIR=/elsewhere tools/build_physx.sh   # build somewhere else
 #   PHYSX_SRC=/a/PhysX/clone tools/build_physx.sh   # other PhysX sources
+#   PHYSX_CMAKE_ARGS="-D..." tools/build_physx.sh   # more CMake settings
+# On Windows (MSVC, from Git Bash) use tools/windows/physx.sh, which calls this.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -24,7 +26,7 @@ SUBMODULE=third_party/PhysX             # NVIDIA-Omniverse/PhysX, PhysX SDK 5.9.
 SRC=${PHYSX_SRC:-$SUBMODULE}
 OUT=${PHYSX_DIR:-build/PhysX}
 GPU=${PHYSX_GPU:-1}
-JOBS=${JOBS:-$(nproc)}
+JOBS=${JOBS:-$(nproc 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")}
 
 if [ ! -f "$SRC/physx/version.txt" ]; then
     if [ "$SRC" = "$SUBMODULE" ]; then
@@ -104,7 +106,7 @@ cmake -S "$P" -B "$OUT/build" $GEN \
     -DPX_GENERATE_GPU_STATIC_LIBRARIES=OFF \
     -DPX_BUILDSNIPPETS=OFF -DPX_BUILDPVDRUNTIME=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    $GPU_FLAGS
+    $GPU_FLAGS ${PHYSX_CMAKE_ARGS:-}
 cmake --build "$OUT/build" -j "$JOBS"
 echo "PhysX libraries:"
-find "$P/lib/bin" -name "*.a" -o -name "*.so" | sort
+find "$P/lib" "$P/bin" \( -name "*.a" -o -name "*.so" -o -name "*.lib" -o -name "*.dll" \) 2>/dev/null | sort || true

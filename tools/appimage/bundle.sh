@@ -32,14 +32,19 @@ step "copying the source tree"
 TREE=$WORK/tree
 rm -rf "$TREE"
 mkdir -p "$TREE"
-cp -r "$SRC/src" "$SRC/shaders" "$SRC/tools" "$SRC/Makefile" "$TREE/"
+cp -r "$SRC/src" "$SRC/shaders" "$SRC/assets" "$SRC/tools" "$SRC/Makefile" "$TREE/"
+mkdir -p "$TREE/third_party"
+cp -r "$SRC/third_party/volk" "$SRC/third_party/stb" "$TREE/third_party/"
 
 step "PhysX ($PHYSX_DIR)"
 "$TREE/tools/build_physx.sh"
 
 step "shader-cube"
 set -- PHYSX_ROOT="$PHYSX_DIR/physx"
-[ -n "${SHADER_CUBE_PKGS:-}" ] && set -- "$@" PKGS="$SHADER_CUBE_PKGS"
+# Vulkan is loaded at runtime (volk), so its loader must not be linked: volk
+# defines the vk* names itself.
+PKGS=$(echo " ${SHADER_CUBE_PKGS:-} " | sed 's/ vulkan / /; s/^ *//; s/ *$//')
+[ -n "$PKGS" ] && set -- "$@" PKGS="$PKGS"
 make -C "$TREE" -j"$JOBS" "$@"
 
 step "AppDir"
@@ -50,8 +55,9 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$SHARE/shader-cube" "$SHARE/applic
          "$SHARE/icons/hicolor/scalable/apps" "$SHARE/icons/hicolor/256x256/apps" "$SHARE/doc/shader-cube"
 install -m 755 "$TREE/shader-cube" "$APPDIR/usr/bin/"
 strip "$APPDIR/usr/bin/shader-cube"
-mkdir -p "$SHARE/shader-cube/shaders"
+mkdir -p "$SHARE/shader-cube/shaders" "$SHARE/shader-cube/assets"
 cp -r "$TREE"/shaders/face* "$TREE/shaders/LICENSE.md" "$SHARE/shader-cube/shaders/"
+cp -r "$TREE/assets/fonts" "$SHARE/shader-cube/assets/"
 GPULIB=$PHYSX_DIR/physx/lib/bin/linux.x86_64/release/libPhysXGpu_64.so
 [ -f "$GPULIB" ] && install -m 755 "$GPULIB" "$APPDIR/usr/lib/"
 install -m 644 "$SRC/tools/appimage/shader-cube.desktop" "$SHARE/applications/"
@@ -161,6 +167,14 @@ cp "$TREE/shaders/LICENSE.md" "$LIC/face-shaders.md"
 row "Face shaders by iq, noztol, whisky_shusuky, baopinsui, katiemil, dathor and FabriceNeyret2" \
     "data files, usr/share/shader-cube/shaders" \
     "per shader, MIT or CC BY-NC-SA 3.0 (non-commercial): licenses/face-shaders.md"
+cp "$TREE/assets/fonts/OFL.txt" "$LIC/Atkinson Hyperlegible (OFL).txt"
+row "Atkinson Hyperlegible font (Braille Institute)" "data files, usr/share/shader-cube/assets/fonts" \
+    "SIL Open Font License 1.1: licenses/Atkinson Hyperlegible (OFL).txt"
+cp "$TREE/third_party/volk/LICENSE.md" "$LIC/volk.txt"
+row "volk (Vulkan meta-loader)" "compiled into shader-cube" "MIT: licenses/volk.txt"
+sed -n '/This software is available under 2 licenses/,$p' "$TREE/third_party/stb/stb_truetype.h" | grep -v '^\*/' \
+    > "$LIC/stb_truetype.txt"
+row "stb_truetype" "compiled into shader-cube" "MIT or public domain: licenses/stb_truetype.txt"
 if [ -f "$PHYSX_DIR/physx/LICENSE.md" ]; then
     PXV=$(cut -d. -f1-3 "$PHYSX_DIR/physx/version.txt" 2>/dev/null || echo 5)
     cp "$PHYSX_DIR/physx/LICENSE.md" "$LIC/NVIDIA PhysX $PXV.txt"
